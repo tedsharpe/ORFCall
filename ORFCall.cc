@@ -35,13 +35,25 @@
 namespace
 {
 char const FASTQ_QUAL_OFFSET = 33;
-unsigned const NCODONS = 64;
+
+// a 6-bit number designating one of the 64 possible codons
+// (AAA=0, AAC=1, ... TTT=63)
+typedef unsigned Codon;
+Codon const NCODONS = 64;
+std::string seqFor( Codon codon )
+{
+    std::string result;
+    result.reserve(3);
+    result.push_back("ACGT"[(codon >> 4) & 3]);
+    result.push_back("ACGT"[(codon >> 2) & 3]);
+    result.push_back("ACGT"[codon & 3]);
+    return result;
+}
 
 typedef unsigned char Call;
-inline Call complement( Call call )
-{ return (call==4) ? 4 : (call^3); }
-inline char charFor( Call call )
-{ return "ACGTN"[call]; }
+Call const NCALL = 4;
+inline Call complement( Call call ) { return (call == 4) ? 4 : (call ^ 3); }
+inline char charFor( Call call ) { return "ACGTN"[call]; }
 
 typedef std::vector<Call> Sequence;
 typedef Sequence::size_type Offset;
@@ -51,10 +63,7 @@ typedef std::vector<Qual> Quals;
 // describes an exon as a pair of offsets on the reference sequence.
 struct Exon
 {
-    explicit Exon( Offset beg, Offset end=0 )
-    : mBegin(beg), mEnd(end) {}
-
-    Offset size() const { return mEnd-mBegin; }
+    Offset size() const { return mEnd - mBegin; }
 
     Offset mBegin;
     Offset mEnd;
@@ -62,6 +71,8 @@ struct Exon
 typedef std::vector<Exon> ORF;
 
 typedef Sequence::const_iterator Kmer;
+inline Codon codonFor( Kmer kmer ) { return (kmer[0]<<4)|(kmer[1]<<2)|kmer[2]; }
+
 // produces a hash value for the next K bases from a sequence.
 class KmerHasher
 {
@@ -69,14 +80,17 @@ public:
     KmerHasher( unsigned K ) : mK(K) {}
 
     size_t operator()( Kmer itr ) const
-    { size_t result = 14695981039346656037ul;
-      for ( Kmer end(itr+mK); itr != end; ++itr )
-          result = 1099511628211ul*(result ^ *itr); // FNV-1a algorithm
-      return result; }
+    {
+        size_t result = 14695981039346656037ul;
+        for ( Kmer end(itr + mK); itr != end; ++itr )
+            result = 1099511628211ul * (result ^ *itr); // FNV-1a algorithm
+        return result;
+    }
 
 private:
     unsigned const mK;
 };
+
 // compares K bases from 2 sequences for equality.
 class KmerComparator
 {
@@ -89,15 +103,15 @@ public:
 private:
     unsigned const mK;
 };
+
 // describes a kmer as unique within the reference or duplicated,
 // and, if unique, where it occurs within the reference and its orientation.
 class KmerLoc
 {
-    enum class Status : char
-    { UNSET, UNIQUE, DUP };
+    enum class Status : char { UNSET, UNIQUE, DUP };
 
 public:
-    KmerLoc() : mStatus(Status::UNSET) {}
+    KmerLoc() : mOffset(0), mIsRC(false), mStatus(Status::UNSET) {}
 
     Offset getOffset() const { return mOffset; }
     bool isRC() const { return mIsRC; }
@@ -112,6 +126,7 @@ private:
     bool mIsRC;
     Status mStatus;
 };
+
 // a map of kmers onto KmerLocs
 typedef std::unordered_map<Kmer,KmerLoc,KmerHasher,KmerComparator> KmerDict;
 
@@ -123,9 +138,6 @@ public:
     Alignment( Offset refStart, Offset refEnd, Offset readStart, bool readRC )
     : mRefStart(refStart), mRefEnd(refEnd),
       mReadStart(readStart), mReadRC(readRC) {}
-
-    Alignment& operator+=( Offset off )
-    { mRefStart += off; mReadStart += off; return *this; }
 
     bool empty() const { return mRefStart==mRefEnd; }
     Offset size() const { return mRefEnd-mRefStart; }
@@ -149,78 +161,91 @@ private:
 class Reference
 {
 public:
-    Reference( char const* refFile,
-                unsigned const K, Qual minQ, double maxMismatchFreq )
-    : mK(K), mMinQ(minQ), mMaxMismatchFrac(maxMismatchFreq),
-      mUniqueKmers(0,KmerHasher(K),KmerComparator(K))
-    { readRefSeq(refFile);
-      if ( mRefSeq.size() < K )
-          FatalErr("There are only " << mRefSeq.size()
-                      << "bases in the reference file");
-      buildRC();
-      buildDictionary(K); }
+    Reference( char const* refFile, char const* planFile, unsigned const K )
+    : mK(K), mUniqueKmers(0,KmerHasher(K),KmerComparator(K))
+    {
+        readRefSeq(refFile);
+        readPlan(planFile);
+        buildDictionary();
+    }
 
     unsigned getK() const { return mK; }
     Sequence const& getRef() const { return mRefSeq; }
 
     ORF const& getORF() const { return mORF; }
-    size_t getORFSize() const
-    { size_t result = 0;
-      for ( Exon const& exon : mORF ) result += exon.size();
-      return result; }
-    Sequence getORFSeq() const
-    { Sequence result; result.reserve(getORFSize());
-      for ( Exon const& exon : mORF )
-        std::copy(mRefSeq.begin()+exon.mBegin,mRefSeq.begin()+exon.mEnd,
-                    std::back_inserter(result) );
-      return result; }
+    std::vector<Codon> const& getORFWTCodons() const { return mWTCodons; }
+    std::vector<int64_t> const& getPlannedMasks() const { return mPlannedMasks; }
 
-    bool findFirstAlignment( Sequence const& seq, Alignment* pAlignment ) const;
-    bool findLastAlignment( Sequence const& seq, Quals const& quals,
-                            Alignment* pAlignment ) const;
+    // finds a maximum-length correspondence between the reference sequence
+    // and another sequence (or its RC) as evidenced by a matching kmer.
+    // if no matching kmer is found, the Alignment will be empty.
+    Alignment findAlignment( Sequence const& seq ) const
+    {
+        if ( seq.size() < mK )
+            return Alignment();
+
+        auto notFound = mUniqueKmers.end();
+        for ( Kmer kmer(seq.begin()), end(seq.end()-mK+1); kmer != end; ++kmer )
+        {
+            auto itr = mUniqueKmers.find(kmer);
+            if ( itr != notFound )
+            {
+                Offset refStart = itr->second.getOffset();
+                Offset readStart = kmer - seq.begin();
+                Offset backOff = std::min(refStart,readStart);
+                refStart -= backOff;
+                readStart -= backOff;
+                Offset len = std::min(mRefSeq.size()-refStart,
+                                        seq.size()-readStart);
+                bool isRC = itr->second.isRC();
+                if ( isRC )
+                {
+                    refStart = mRefSeq.size()-refStart-len;
+                    readStart = seq.size()-readStart-len;
+                }
+                return Alignment(refStart,refStart+len,readStart,isRC);
+            }
+        }
+        return Alignment();
+    }
 
     void report() const
-    { size_t refLen = mRefSeq.size();
-      std::cerr << "Reference length: " << refLen << ".\n";
-      std::cerr << "Dict size: " << mUniqueKmers.size()
-                        << " (" << 2*(refLen-mK+1)-mUniqueKmers.size()
-                        << " duplicate kmers).\n";
-      std::cerr << "ORF length: " << getORFSize() << ".\n";
-      std::cerr << "ORF segments:";
-      char prefix = ' ';
-      // leave final sentinel out of description (that's the end()-1 business.)
-      for ( auto itr=mORF.begin(),end=mORF.end()-1; itr != end; ++itr )
-      { std::cerr << prefix << itr->mBegin+1 << ':' << itr->mEnd+1;
-        prefix = ','; }
-      std::cerr << ".\n"; }
+    {
+        size_t refLen = mRefSeq.size();
+        std::cerr << "Reference length: " << refLen << ".\n";
+        std::cerr << "Dict size: " << mUniqueKmers.size() << " ("
+                << 2 * (refLen - mK + 1) - mUniqueKmers.size()
+                << " duplicate kmers).\n";
+        std::cerr << "ORF length in codons: " << mWTCodons.size() << ".\n";
+        std::cerr << "ORF segments:";
+        char prefix = ' ';
+        // leave final sentinel out of description
+        for ( auto itr = mORF.begin(), end = mORF.end()-1; itr != end; ++itr )
+        {
+            std::cerr << prefix << itr->mBegin + 1 << ':' << itr->mEnd + 1;
+            prefix = ',';
+        }
+        std::cerr << ".\n";
+    }
 
 private:
     void readRefSeq( char const* refFile );
-
-    void buildRC()
-    { // store the RC of the reference sequence
-      mRefSeqRC.reserve(mRefSeq.size());
-      for ( auto itr=mRefSeq.rbegin(),end=mRefSeq.rend(); itr != end; ++itr )
-        mRefSeqRC.push_back(complement(*itr)); }
-
-    void buildDictionary( unsigned const K );
-    double mismatchFraction( Sequence::const_iterator itr,
-                             Sequence::const_iterator end,
-                             Sequence::const_iterator rItr,
-                             Quals::const_iterator qItr ) const
-    { unsigned comparisons = 0, mismatches = 0;
-      while ( itr != end )
-      { if ( *qItr >= mMinQ ) { ++comparisons; mismatches += (*itr != *rItr); }
-        ++itr; ++qItr; ++rItr; }
-      return comparisons ? 1.*mismatches/comparisons : 1.; }
+    void readPlan( char const* planFile );
+    void buildDictionary();
 
     unsigned mK;
-    Qual mMinQ;
-    double const mMaxMismatchFrac;
     Sequence mRefSeq;
     Sequence mRefSeqRC;
-    ORF mORF;
     KmerDict mUniqueKmers;
+
+    // ref seq boundaries for the ORF (i.e., exon locations on ref)
+    ORF mORF;
+
+    // WT codon value for each codon in the ORF
+    std::vector<Codon> mWTCodons;
+
+    // bit mask of other codon values that we might expect to see for each codon
+    std::vector<int64_t> mPlannedMasks;
 };
 
 void Reference::readRefSeq( char const* refFile )
@@ -257,7 +282,7 @@ void Reference::readRefSeq( char const* refFile )
             case '[':
                 if ( inORF )
                     FatalErr("Nested ORF segment at line " << lineNo);
-                inORF=true; mORF.emplace_back(mRefSeq.size()); break;
+                inORF=true; mORF.push_back(Exon{mRefSeq.size(),0}); break;
             case ']':
                 if ( !inORF )
                     FatalErr("Unopened ORF segment at line " << lineNo);
@@ -274,96 +299,110 @@ void Reference::readRefSeq( char const* refFile )
     {
         std::cerr << "No ORF marked -- using entire reference sequence as ORF"
                 << std::endl;
-        mORF.emplace_back(0,mRefSeq.size());
+        mORF.push_back(Exon{0,mRefSeq.size()});
     }
     if ( !ifs.eof() )
         FatalErr("Failed to read reference file to the end.");
+
+    if ( mRefSeq.size() < mK )
+        FatalErr("There are only " << mRefSeq.size()
+                    << "bases in the reference file.  K is too big.");
+
     // add sentinel
-    mORF.emplace_back(mRefSeq.size(),mRefSeq.size());
+    mORF.push_back(Exon{mRefSeq.size(),mRefSeq.size()});
+
+    size_t orfSize = 0ul;
+    for ( Exon const& exon : mORF )
+        orfSize += exon.size();
+    if ( orfSize % 3 )
+        FatalErr("There are " << orfSize <<
+                " bases in the ORF, which isn't divisible by 3.");
+
+    Sequence orfSeq;
+    orfSeq.reserve(orfSize);
+    for ( Exon const& exon : mORF )
+        std::copy(mRefSeq.begin()+exon.mBegin,mRefSeq.begin()+exon.mEnd,
+                    std::back_inserter(orfSeq) );
+
+    size_t nCodons = orfSize / 3;
+    mWTCodons.reserve(nCodons);
+    for ( Kmer itr(orfSeq.begin()), end(orfSeq.end()); itr < end; itr += 3 )
+        mWTCodons.push_back(codonFor(itr));
 }
 
-bool Reference::findFirstAlignment( Sequence const& seq, Alignment* pAln ) const
-{
-    if ( seq.size() < mK )
-        return false;
+void Reference::readPlan( char const* planFile ) {
+    std::ifstream ifs(planFile,std::ios_base::in|std::ios_base::binary);
+    if ( !ifs )
+        FatalErr("Can't open plan file: " << planFile);
 
-    Kmer kmer(seq.begin());
-    Kmer end(seq.end()-mK+1);
-    auto notFound = mUniqueKmers.end();
-    for ( auto kmer=seq.begin(),end=seq.end()-mK+1; kmer != end; ++kmer )
+    std::string line;
+    if ( !std::getline(ifs,line) || line.size() != 64*3+63 )
+        FatalErr("Can't read plan file header.");
+
+    size_t nCodons = mWTCodons.size();
+    size_t lineNo = 0;
+    mPlannedMasks.reserve(nCodons);
+    while ( std::getline(ifs,line) )
     {
-        auto itr = mUniqueKmers.find(kmer);
-        if ( itr != notFound )
+        ++lineNo;
+        if ( line.size() != 64+63 )
+            FatalErr("Plan file line " << lineNo << " is weird:\n" << line);
+        int64_t val = 0;
+        for ( Codon codon = 0; codon < NCODONS-1; ++codon )
         {
-            Offset readStart = kmer-seq.begin();
-            Offset refStart = itr->second.getOffset();
-            bool isRC = itr->second.isRC();
-            if ( isRC )
-            {
-                readStart = seq.size()-(readStart+mK);
-                refStart = mRefSeq.size()-(refStart+mK);
-            }
-            *pAln = Alignment(refStart,refStart+mK,readStart,isRC);
-            return true;
+            char chr = line[2*codon+1];
+            if ( chr != '\t' && chr != ' ' )
+                FatalErr("Plan file line " << lineNo << " is weird:\n" << line);
         }
-    }
-    return false;
-}
-
-bool Reference::findLastAlignment( Sequence const& seq, Quals const& quals,
-                                    Alignment* pAln ) const
-{
-    if ( seq.size() < mK )
-    {
-        *pAln = Alignment();
-        return false;
-    }
-    Kmer kmer(seq.end()-mK+1);
-    Kmer beg(seq.begin());
-    auto notFound = mUniqueKmers.end();
-    while ( kmer != beg )
-    {
-        auto itr = mUniqueKmers.find(--kmer);
-        if ( itr != notFound )
+        for ( Codon codon = 0; codon < NCODONS; ++codon )
         {
-            Offset refStart = itr->second.getOffset();
-            Offset refEnd = refStart + mK;
-            Offset readStart = kmer-beg;
-            Offset backOff = std::min(refStart,readStart);
-            refStart -= backOff;
-            readStart -= backOff;
-            bool isRC = itr->second.isRC();
-            Sequence const& ref = isRC ? mRefSeqRC : mRefSeq;
-            double mmFrac = mismatchFraction(ref.begin()+refStart,
-                                              ref.begin()+refEnd,
-                                              seq.begin()+readStart,
-                                              quals.begin()+readStart);
-            if ( isRC )
+            switch (line[2*codon])
             {
-                readStart = seq.size()-(readStart+(refEnd-refStart));
-                refStart = mRefSeq.size()-refStart;
-                refEnd = mRefSeq.size()-refEnd;
-                std::swap(refStart,refEnd);
+            case '0': break;
+            case '1': val |= 1ul << codon; break;
+            case '2':
+                if ( lineNo <= nCodons )
+                {
+                    Codon refCodon = mWTCodons[lineNo-1];
+                    if ( refCodon != codon )
+                        FatalErr("Plan file line " << lineNo <<
+                                " indicates WT for codon " << seqFor(codon) <<
+                                " but the reference sequence has codon "
+                                << seqFor(refCodon) << " at that position.");
+                }
+                break;
+            default:
+                FatalErr("Plan file line " << lineNo << " is weird:\n" << line);
             }
-            *pAln = Alignment(refStart,refEnd,readStart,isRC);
-            return mmFrac <= mMaxMismatchFrac;
         }
+        mPlannedMasks.push_back(val);
     }
-    *pAln = Alignment();
-    return false;
+    if ( mPlannedMasks.size() > nCodons )
+        FatalErr("Plan file has " << mPlannedMasks.size() <<
+                    " lines, but there are only " << nCodons << " codons.");
+    else if ( mPlannedMasks.size() < nCodons )
+    {
+        std::cerr << "Warning: Plan file has only " << mPlannedMasks.size() <<
+            " lines, but there are " << nCodons << " codons." << std::endl;
+        mPlannedMasks.resize(nCodons);
+    }
 }
 
-void Reference::buildDictionary( unsigned const K )
+void Reference::buildDictionary()
 {
+    mRefSeqRC.reserve(mRefSeq.size());
+    for ( auto itr=mRefSeq.rbegin(),end=mRefSeq.rend(); itr != end; ++itr )
+        mRefSeqRC.push_back(complement(*itr));
+
     // build a dictionary of unique kmers in ref and ref RC
     mUniqueKmers.reserve(2*mRefSeq.size());
-    Kmer end(mRefSeq.end()-K+1);
     Offset offset = 0;
+    Kmer end(mRefSeq.end()-mK+1);
     for ( Kmer itr(mRefSeq.begin()); itr != end; ++itr )
         mUniqueKmers[itr].set(offset++,false);
 
-    end = mRefSeqRC.end()-K+1;
     offset = 0;
+    end = mRefSeqRC.end()-mK+1;
     for ( Kmer itr(mRefSeqRC.begin()); itr != end; ++itr )
         mUniqueKmers[itr].set(offset++,true);
 
@@ -392,10 +431,12 @@ public:
 
 private:
     std::istream* openStream( char const* fastqFile )
-    { auto len = strlen(fastqFile);
-      if ( len >= 3 && !memcmp(fastqFile+len-3,".gz",3) )
-        return new igzstream(fastqFile,std::ios_base::in|std::ios_base::binary);
-      return new std::ifstream(fastqFile,std::ios_base::in|std::ios_base::binary);
+    {
+        auto len = strlen(fastqFile);
+        auto flags = std::ios_base::in | std::ios_base::binary;
+        if ( len >= 3 && !memcmp(fastqFile + len - 3, ".gz", 3) )
+            return new igzstream(fastqFile, flags);
+        return new std::ifstream(fastqFile, flags);
     }
 
     std::istream* mpIS;
@@ -468,7 +509,7 @@ bool FastqReader::getChunk( std::vector<Sequence>& seqs,
     return !seqs.empty();
 }
 
-// a translator of codons (6-bit values encoding 3 base calls) into amino acids.
+// a translator of codons (6-bit values encoding 3 base calls) into amino acid symbols.
 class AminoAcidNamer
 {
 public:
@@ -479,7 +520,7 @@ public:
                     << " characters.");
       auto beg = mLabels.begin(), end = mLabels.end();
       std::sort(beg,end);
-      mLabels.resize(std::unique(beg,end)-beg);
+      mLabels.resize(size_t(std::unique(beg,end)-beg));
       end = mLabels.end();
       for ( size_t idx = 0; idx != NCODONS; ++idx )
         mCodonToAA[idx] = std::lower_bound(beg,end,codonTranslation[idx])-beg; }
@@ -491,12 +532,8 @@ public:
       for ( size_t idx : mCodonToAA )
           aaCounts[idx] += *codonCounts++; }
 
-    size_t indexFor( Sequence::const_iterator itr ) const
-    { unsigned codon = *itr << 4; codon |= *++itr << 2; codon |= *++itr;
-      return mCodonToAA[codon]; }
-
     // translate a 6-bit codon value to an amino acid index
-    size_t indexFor( unsigned codon ) const { return mCodonToAA[codon]; }
+    size_t indexFor( Codon codon ) const { return mCodonToAA[codon]; }
 
     // a container of amino acid names
     size_t size() const { return mLabels.size(); }
@@ -511,39 +548,14 @@ private:
 
 struct CodonCounts
 {
-    CodonCounts() : mCounts{}, mIndelCounts{} {}
+    CodonCounts() : mCounts{}, mIndelCounts{}, mCoverage(0) {}
 
     size_t mCounts[NCODONS];
     size_t mIndelCounts[2];
+    size_t mCoverage;
 };
 typedef std::vector<CodonCounts> CodonCountsVec;
 typedef CodonCountsVec::iterator CCVItr;
-
-// keeps track of codon boundaries during sequential processing of sequence.
-// bumps the appropriate counter when we have a whole codon.
-class CodonAccumulator
-{
-public:
-    CodonAccumulator( CCVItr beg, Offset orfOffset, Qual minQ )
-    : mCCVItr(beg+orfOffset/3), mCount(orfOffset%3), mCodon(0), mIsHQ(!mCount),
-      mMinQ(minQ) {}
-
-    void operator()( Call call, Qual qual )
-    { if ( (mIsHQ = mIsHQ && qual >= mMinQ) )
-        mCodon = ((mCodon << 2) | call) & 0x3F;
-      if ( ++mCount == 3 )
-      { if ( mIsHQ ) mCCVItr->mCounts[mCodon] += 1;
-        mIsHQ = true;
-        mCount = 0;
-        ++mCCVItr; } }
-
-private:
-    CCVItr mCCVItr;  // the counter to bump when the codon is complete
-    unsigned mCount; // which position of the codon are we pointing to
-    unsigned mCodon; // the 6-bit value of the codon
-    bool mIsHQ;      // are all the calls in the codon of high quality?
-    Qual mMinQ;      // what it means to be high quality
-};
 
 class SmithWatermanizer
 {
@@ -559,15 +571,14 @@ public:
         unsigned mLen;
     };
 
-    int align( Sequence::const_iterator bX, Sequence::const_iterator eX,
-                Sequence::const_iterator bY, Sequence::const_iterator eY,
-                std::ostream* pOS=nullptr )
-    { int result = score(bX,eX,bY,eY);
+    std::vector<Block> const& align( Sequence::const_iterator bX,
+                                     Sequence::const_iterator eX,
+                                     Sequence::const_iterator bY,
+                                     Sequence::const_iterator eY,
+                                     std::ostream* pOS=nullptr )
+    { score(bX,eX,bY,eY);
       traceback(bX,eX,bY,eY,pOS);
-      return result; }
-
-    std::vector<Block> const& getMatchup() const
-    { return mMatchup; }
+      return mMatchup; }
 
 private:
     static int const GAP_OPEN = -14;
@@ -575,12 +586,12 @@ private:
     static int const MATCH = 4;
     static int const MIS_MATCH = -6;
 
-    int score( Sequence::const_iterator bX, Sequence::const_iterator eX,
-               Sequence::const_iterator bY, Sequence::const_iterator eY );
+    void score( Sequence::const_iterator bX, Sequence::const_iterator eX,
+                Sequence::const_iterator bY, Sequence::const_iterator eY );
 
     void traceback( Sequence::const_iterator bX, Sequence::const_iterator eX,
                     Sequence::const_iterator bY, Sequence::const_iterator eY,
-                    std::ostream* pOS );
+                    std::ostream* pOS=nullptr );
 
     static int max3( int dScore, int hScore, int vScore, Trace* pTrace )
     { int result;
@@ -606,6 +617,9 @@ private:
     // traceback pointers for the entire matrix
     std::vector<Trace> mTraceback;
 
+    // where to start the traceback
+    Trace* mpBestTracebackStart;
+
     // traceback builds this structure
     std::vector<Block> mMatchup;
 
@@ -619,10 +633,10 @@ int const SmithWatermanizer::GAP_EXTEND;
 int const SmithWatermanizer::MATCH;
 int const SmithWatermanizer::MIS_MATCH;
 
-int SmithWatermanizer::score( Sequence::const_iterator bX,
-                              Sequence::const_iterator eX,
-                              Sequence::const_iterator bY,
-                              Sequence::const_iterator eY )
+void SmithWatermanizer::score( Sequence::const_iterator bX,
+                               Sequence::const_iterator eX,
+                               Sequence::const_iterator bY,
+                               Sequence::const_iterator eY )
 {
     using std::distance;
     auto nCols = distance(bX,eX);
@@ -633,7 +647,7 @@ int SmithWatermanizer::score( Sequence::const_iterator bX,
     *pTrace++ = Trace::DONE;
     std::fill(pTrace,pTrace+nCols,Trace::LEFT);
     pTrace += nCols;
-    int rowInit = GAP_OPEN;
+    int rowInit = 0;//GAP_OPEN;
     int colInit = GAP_OPEN;
     Call baseX0 = *bX;
 
@@ -667,6 +681,9 @@ int SmithWatermanizer::score( Sequence::const_iterator bX,
         *pMaxScore++ = maxScore;
     }
 
+    int bestRowScore = maxScore;
+    Trace* pBestTrace = pTrace;
+
     int maxScorePrevRow;
     while ( ++bY != eY )
     {
@@ -677,7 +694,7 @@ int SmithWatermanizer::score( Sequence::const_iterator bX,
 
         // (0,1..m) can't extend hGap
         dScore = rowInit + (baseX0==baseY ? MATCH : MIS_MATCH);
-        rowInit += GAP_EXTEND;
+        //rowInit += GAP_EXTEND;
         hScore = rowInit + GAP_OPEN;
         maxScorePrevRow = *pMaxScore;
         vScore = std::max(maxScorePrevRow+GAP_OPEN,*pVScore+GAP_EXTEND);
@@ -704,8 +721,14 @@ int SmithWatermanizer::score( Sequence::const_iterator bX,
             *pVScore++ = vScore;
             *pMaxScore++ = maxScore;
         }
+
+        if ( maxScore > bestRowScore )
+        {
+            bestRowScore = maxScore;
+            pBestTrace = pTrace;
+        }
     }
-    return maxScore;
+    mpBestTracebackStart = pBestTrace-1;
 }
 
 void SmithWatermanizer::traceback( Sequence::const_iterator bX,
@@ -723,7 +746,9 @@ void SmithWatermanizer::traceback( Sequence::const_iterator bX,
         mLineY.clear();
         mLineZ.clear();
     }
-    Trace* pTB = &mTraceback.back();
+    Trace* pTB = mpBestTracebackStart;
+    eY -= (&mTraceback.back() - pTB - 1)/(nCols + 1);
+
     unsigned len = 0;
     while ( *pTB != Trace::DONE )
     {
@@ -765,59 +790,178 @@ void SmithWatermanizer::traceback( Sequence::const_iterator bX,
             len = 0;
         }
     }
+
     std::reverse(mMatchup.begin(),mMatchup.end());
+
     if ( pOS )
     {
         if ( bX!=eX || bY!=eY )
             FatalErr("Internal error in traceback.");
+
+        Block const& firstBlock = mMatchup[0];
+        if ( firstBlock.mDir == Trace::UP )
+        {
+            len = mLineX.size() - firstBlock.mLen;
+            mLineX.resize(len);
+            mLineY.resize(len);
+            mLineZ.resize(len);
+        }
         std::reverse(mLineX.begin(), mLineX.end());
-        *pOS << mLineX;
+        *pOS << mLineX << '\n';
         std::reverse(mLineY.begin(), mLineY.end());
-        *pOS << mLineY;
+        *pOS << mLineY << '\n';
         std::reverse(mLineZ.begin(), mLineZ.end());
-        *pOS << mLineZ;
+        *pOS << mLineZ << '\n';
     }
 }
 
+enum class VariationType { ALTERNATE_CODON, INSERTION, DELETION };
+struct Variation
+{
+    VariationType mType;
+    Offset mCodonIdx;
+    // when mType is ALTERNATE_CODON, mValue is the alternate Codon
+    // when INSERTION or DELETION, mValue is the length of the indel
+    unsigned mValue;
+
+    friend bool operator<( Variation const& var1, Variation const& var2 )
+    { if ( var1.mType != var2.mType ) return var1.mType < var2.mType;
+      if ( var1.mCodonIdx != var2.mCodonIdx )
+          return var1.mCodonIdx < var2.mCodonIdx;
+      return var1.mValue < var2.mValue; }
+
+    friend bool operator==( Variation const& var1, Variation const& var2 )
+    { return var1.mType == var2.mType &&
+            var1.mCodonIdx == var2.mCodonIdx &&
+            var1.mValue == var2.mValue; }
+};
+
+struct ReadReport
+{
+    Offset mBeginCoverage;
+    Offset mEndCoverage;
+    size_t mNMismatches; // exclusive of those in the 1st alternate codon
+    std::vector<Variation> mVariations;
+};
+
+class AlignmentScorer
+{
+public:
+    AlignmentScorer( Reference const& ref, Offset refStart, Qual minQ )
+    : mRefPos(refStart), mExonItr(ref.getORF().begin()), mNextExon{0,0},
+      mWTBeg(ref.getORFWTCodons().begin()), mMinQ(minQ),
+      mCodon(0), mPhase(0), mNCodonMismatches(0), mNHiQCalls(0),
+      mFirstCodonCovered(0), mNMismatches(0)
+    {
+        while ( mExonItr->mEnd <= mRefPos )
+            mFirstCodonCovered += mExonItr->size();
+        mNextExon = *mExonItr;
+        if ( mRefPos > mExonItr->mBegin )
+            mFirstCodonCovered += mRefPos - mExonItr->mBegin;
+        mPhase = mFirstCodonCovered % 3;
+        mFirstCodonCovered = mFirstCodonCovered / 3;
+        mWTItr = ref.getORFWTCodons().begin()+mFirstCodonCovered;
+        mPlannedItr = ref.getPlannedMasks().begin()+mFirstCodonCovered;
+        mCodon = *mWTItr >> ((3 - mPhase)*2);
+    }
+
+    void operator()( Call wtCall, Call call, Qual qual )
+    {
+        if ( mRefPos == mNextExon.mEnd )
+            mNextExon = *++mExonItr;
+        if ( mRefPos++ < mNextExon.mBegin )
+        {
+            if ( wtCall != call && qual >= mMinQ )
+                mNMismatches += 1;
+        }
+        else
+        {
+            if ( qual >= mMinQ )
+            {
+                mNHiQCalls += 1;
+                if ( wtCall != call )
+                {
+                    mNMismatches += 1;
+                    mNCodonMismatches += 1;
+                }
+            }
+            mCodon = (mCodon << 2) | call;
+            if ( ++mPhase == 3 )
+            {
+                if ( mCodon != *mWTItr &&
+                     ((1ul << mCodon) & *mPlannedItr) &&
+                     mNHiQCalls == 3 )
+                {
+                    if ( mVariations.empty() )
+                        mNMismatches -= mNCodonMismatches;
+                    mVariations.push_back(
+                        Variation{VariationType::ALTERNATE_CODON,
+                                   Offset(mWTItr-mWTBeg),
+                                   mCodon} );
+                }
+                mCodon = 0;
+                mPhase = 0;
+                mNCodonMismatches = 0;
+                mNHiQCalls = 0;
+                ++mWTItr;
+                ++mPlannedItr;
+            }
+        }
+    }
+
+    bool inORF() const { return mRefPos >= mNextExon.mBegin; }
+    Offset getCodonIdx() const { return Offset(mWTItr-mWTBeg); }
+
+    ReadReport getReport() const
+    {
+        return ReadReport{mFirstCodonCovered,
+                          Offset(mWTItr-mWTBeg),
+                          mNMismatches,
+                          mVariations};
+    }
+
+private:
+    // stuff to track where we are in the ORF
+    Offset mRefPos;
+    ORF::const_iterator mExonItr;
+    Exon mNextExon;
+    std::vector<Codon>::const_iterator mWTBeg;
+    std::vector<Codon>::const_iterator mWTItr;
+    std::vector<int64_t>::const_iterator mPlannedItr;
+
+    // a quality score must be at least this high to count a mismatch
+    Qual mMinQ;
+
+    // stuff to track the current codon
+    Codon mCodon;
+    unsigned mPhase;
+    unsigned mNCodonMismatches;
+    unsigned mNHiQCalls;
+
+    // stuff to report at the end
+    Offset mFirstCodonCovered;
+    size_t mNMismatches;
+    std::vector<Variation> mVariations;
+};
+
 // processes reads, looking for alignments that overlap the ORF, and counting up
-// the codon values that we see.
+// reads that contain a single alternate codon (according to the plan) or that
+// contain indels.
 class ORFCaller
 {
 public:
     ORFCaller( Reference const& ref, double minSW, Qual minQ,
-                AminoAcidNamer const& aaNamer, std::ostream* pJunkOS )
-    : mRef(ref), mMinPerBaseSWScore(minSW), mMinQ(minQ), mAANamer(aaNamer),
-      mCCV(ref.getORFSize()/3), mNReads(0), mNAlignedReads(0),
+                        unsigned maxSeqErrs, AminoAcidNamer const& aaNamer,
+                        std::ostream* pJunkOS )
+    : mRef(ref), mMinPerBaseSWScore(minSW), mMinQ(minQ),
+      mMaxSeqErrs(maxSeqErrs), mAANamer(aaNamer),
+      mCCV(ref.getORFWTCodons().size()), mNReads(0), mNAlignedReads(0),
       mNFPIndelReads(0), mNFSIndelReads(0), mpJunkOS(pJunkOS)
     {}
 
-    void processRead( Sequence const& seq, Quals const& quals,
-                        char const* fileName, size_t readId )
-    { Alignment aln;
-      mIndelLocs.clear();
-      if ( findAlignment(seq,quals,fileName,readId,&aln) )
-        processAlignment(aln,seq,quals);
-      processIndelLocs(); }
+    void processFastqs( char** beg, char** end );
 
-    void processPairedRead( Sequence const& seq1, Quals const& quals1,
-                            Sequence const& seq2, Quals const& quals2,
-                            char const* fileName1, char const* fileName2,
-                            size_t readId )
-    { Alignment aln1, aln2;
-      mIndelLocs.clear();
-      if ( findAlignment(seq1,quals1,fileName1,readId,&aln1) )
-      { if ( !findAlignment(seq2,quals2,fileName2,readId,&aln2) )
-          processAlignment(aln1,seq1,quals1);
-        else if ( Alignment::disjoint(aln1,aln2) )
-        { processAlignment(aln1,seq1,quals1);
-          processAlignment(aln2,seq2,quals2); }
-        else if ( aln1.getRefStart() <= aln2.getRefStart() )
-          processAlignmentPair(aln1,aln2,seq1,seq2,quals1,quals2);
-        else
-          processAlignmentPair(aln2,aln1,seq2,seq1,quals2,quals1); }
-      else if ( findAlignment(seq2,quals2,fileName2,readId,&aln2) )
-        processAlignment(aln2,seq2,quals2);
-      processIndelLocs(); }
+    void processPairedFastqs( char** beg, char** end );
 
     double getFractionAligned() const
     { return mNReads ? 1.*mNAlignedReads/mNReads : 0.; }
@@ -828,23 +972,162 @@ public:
     void report( std::ostream& os );
 
 private:
-    bool findAlignment( Sequence const& seq, Quals const& quals,
-                        char const* fileName, size_t readId, Alignment* pAln )
-    { ++mNReads;
-      if ( mRef.findLastAlignment(seq,quals,pAln) )
-        return true;
-      if ( !findIndels(*pAln,seq,quals) )
-        dumpNonAligner(fileName,readId,seq,quals);
-      return false; }
+    void processRead( Sequence const& seq, Quals const& quals,
+                        char const* fileName, size_t readId )
+    {
+        mNReads += 1;
+        Alignment aln = mRef.findAlignment(seq);
+        if ( aln.empty() )
+            dumpNonAligner(fileName,readId,seq,quals);
+        else
+            processAlignment(seq,quals,aln);
+    }
 
-    bool findIndels( Alignment const& aln,
-                        Sequence const& seq, Quals const& quals );
-    void processIndelLocs();
-    void processAlignment( Alignment const& aln,
-                            Sequence const& seq, Quals const& quals );
-    void processAlignmentPair( Alignment const& aln1, Alignment const& aln2,
-                                Sequence const& seq1, Sequence const& seq2,
-                                Quals const& quals1, Quals const& quals2 );
+    void processPairedRead( Sequence const& seq1, Quals const& quals1,
+                            Sequence const& seq2, Quals const& quals2,
+                            char const* fileName1, char const* fileName2,
+                            size_t readId )
+    {
+        mNReads += 2;
+        Alignment aln1 = mRef.findAlignment(seq1);
+        Alignment aln2 = mRef.findAlignment(seq2);
+        if ( aln1.empty() )
+        {
+            dumpNonAligner(fileName1,readId,seq1,quals1);
+            if ( aln2.empty() )
+                dumpNonAligner(fileName2,readId,seq2,quals2);
+            else
+                processAlignment(seq2,quals2,aln2);
+        }
+        else if ( aln2.empty() )
+        {
+            dumpNonAligner(fileName2,readId,seq2,quals2);
+            processAlignment(seq1,quals1,aln1);
+        }
+        else if ( Alignment::disjoint(aln1,aln2) )
+        {
+            processAlignment(seq1,quals1,aln1);
+            processAlignment(seq2,quals2,aln2);
+        }
+        else
+        {
+            mNAlignedReads += 2;
+            ReadReport report1 = findAlternateCodons(seq1,quals1,aln1);
+            if ( report1.mNMismatches > mMaxSeqErrs ||
+                    report1.mVariations.size() > 1 )
+                report1 = findIndels(aln1,seq1,quals1);
+            ReadReport report2 = findAlternateCodons(seq2,quals2,aln2);
+            if ( report2.mNMismatches > mMaxSeqErrs ||
+                    report2.mVariations.size() > 1 )
+                report2 = findIndels(aln2,seq2,quals2);
+            if ( report1.mNMismatches <= mMaxSeqErrs )
+            {
+                if ( report2.mNMismatches > mMaxSeqErrs )
+                    processReport(report1);
+                else
+                {
+                    ReadReport combo{
+                        std::min(report1.mBeginCoverage,report2.mBeginCoverage),
+                        std::max(report1.mEndCoverage,report2.mEndCoverage),
+                        report1.mNMismatches+report2.mNMismatches,
+                        report1.mVariations
+                    };
+                    combo.mVariations.insert(combo.mVariations.end(),
+                                                report2.mVariations.begin(),
+                                                report2.mVariations.end());
+                    auto beg(combo.mVariations.begin());
+                    auto end(combo.mVariations.end());
+                    std::sort(beg,end);
+                    combo.mVariations.erase(std::unique(beg,end),end);
+                    processReport(combo);
+                }
+            }
+            else if ( report2.mNMismatches <= mMaxSeqErrs )
+                processReport(report2);
+        }
+    }
+
+    void processAlignment( Sequence const& seq, Quals const& quals,
+                                Alignment const& aln )
+    {
+        mNAlignedReads += 1;
+        ReadReport readReport = findAlternateCodons(seq,quals,aln);
+        if ( readReport.mNMismatches > mMaxSeqErrs ||
+                readReport.mVariations.size() > 1 )
+            readReport = findIndels(aln,seq,quals);
+        if ( readReport.mNMismatches <= mMaxSeqErrs )
+            processReport(readReport);
+    }
+
+    ReadReport findAlternateCodons( Sequence const& seq,
+                                    Quals const& quals,
+                                    Alignment const& aln )
+    {
+        AlignmentScorer alignmentScorer(mRef,aln.getRefStart(),mMinQ);
+        auto refItr(mRef.getRef().begin()+aln.getRefStart());
+        auto refEnd(mRef.getRef().begin()+aln.getRefEnd());
+        if ( !aln.isReadRC() )
+        {
+            auto readItr(seq.begin()+aln.getReadStart());
+            auto qualItr(quals.begin()+aln.getReadStart());
+            while ( refItr != refEnd )
+            {
+                alignmentScorer(*refItr,*readItr,*qualItr);
+                ++refItr; ++readItr; ++qualItr;
+            }
+        }
+        else
+        {
+            auto readItr(seq.rbegin()+aln.getReadStart());
+            auto qualItr(quals.rbegin()+aln.getReadStart());
+            while ( refItr != refEnd )
+            {
+                alignmentScorer(*refItr,complement(*readItr),*qualItr);
+                ++refItr; ++readItr; ++qualItr;
+            }
+        }
+        return alignmentScorer.getReport();
+    }
+
+    ReadReport findIndels( Alignment const& aln,
+                            Sequence const& seq,
+                            Quals const& quals );
+
+    void processReport( ReadReport const& readReport )
+    {
+        for ( auto itr(mCCV.begin()+readReport.mBeginCoverage),
+                end(mCCV.begin()+readReport.mEndCoverage);
+                itr != end; ++itr )
+            itr->mCoverage += 1;
+
+        bool readHasFrameShiftIndel = false;
+        bool readHasNonFrameShiftIndel = false;
+        for ( Variation const& var : readReport.mVariations )
+        {
+            switch ( var.mType )
+            {
+            case VariationType::ALTERNATE_CODON:
+                mCCV[var.mCodonIdx].mCounts[var.mValue] += 1;
+                break;
+            case VariationType::DELETION:
+            case VariationType::INSERTION:
+                {
+                    bool isFrameShift = (var.mValue%3) != 0;
+                    mCCV[var.mCodonIdx].mIndelCounts[isFrameShift] += 1;
+                    if ( isFrameShift )
+                        readHasFrameShiftIndel = true;
+                    else
+                        readHasNonFrameShiftIndel = true;
+                }
+                break;
+            }
+        }
+        if ( readHasFrameShiftIndel )
+            mNFSIndelReads += 1;
+        if ( readHasNonFrameShiftIndel )
+            mNFPIndelReads += 1;
+    }
+
     void dumpNonAligner( char const* fileName, size_t readId,
                             Sequence const& seq, Quals const& quals )
     { if ( !mpJunkOS ) return;
@@ -855,25 +1138,10 @@ private:
       for ( Qual qual : quals ) os << (char)(qual+FASTQ_QUAL_OFFSET);
       os << '\n'; }
 
-    struct IndelLoc
-    {
-        IndelLoc( Offset codonId, bool isFrameShift )
-        : mCodonId(codonId), mFrameShift(isFrameShift) {}
-
-        friend bool operator<( IndelLoc const& il1, IndelLoc const& il2 )
-        { if ( il1.mCodonId != il2.mCodonId )
-            return il1.mCodonId < il2.mCodonId;
-          return il1.mFrameShift < il2.mFrameShift; }
-        friend bool operator==( IndelLoc const& il1, IndelLoc const& il2 )
-        { return il1.mCodonId == il2.mCodonId &&
-                    il1.mFrameShift==il2.mFrameShift; }
-        Offset mCodonId;
-        bool mFrameShift;
-    };
-
     Reference const& mRef;
     double mMinPerBaseSWScore;
     Qual mMinQ;
+    unsigned mMaxSeqErrs;
     AminoAcidNamer const& mAANamer;
     CodonCountsVec mCCV;
     size_t mNReads;
@@ -884,33 +1152,9 @@ private:
     Sequence mSeqTmp;
     Quals mQualsTmp;
     SmithWatermanizer mSW;
-    std::vector<IndelLoc> mIndelLocs;
+    static Offset const SW_REF_PAD = 5;
 };
-
-
-void ORFCaller::writeCodonCounts( std::string const& filename )
-{
-    std::ofstream ofs(filename);
-    ofs <<
-"AAA\tAAC\tAAG\tAAT\tACA\tACC\tACG\tACT\tAGA\tAGC\tAGG\tAGT\tATA\tATC\tATG\tATT\t"
-"CAA\tCAC\tCAG\tCAT\tCCA\tCCC\tCCG\tCCT\tCGA\tCGC\tCGG\tCGT\tCTA\tCTC\tCTG\tCTT\t"
-"GAA\tGAC\tGAG\tGAT\tGCA\tGCC\tGCG\tGCT\tGGA\tGGC\tGGG\tGGT\tGTA\tGTC\tGTG\tGTT\t"
-"TAA\tTAC\tTAG\tTAT\tTCA\tTCC\tTCG\tTCT\tTGA\tTGC\tTGG\tTGT\tTTA\tTTC\tTTG\tTTT";
-
-    for ( CodonCounts const& cCounts : mCCV )
-    {
-        char prefix = '\n';
-        for ( size_t count : cCounts.mCounts )
-        {
-            ofs << prefix << count;
-            prefix = '\t';
-        }
-    }
-    ofs << '\n';
-    ofs.close();
-    if ( !ofs )
-        FatalErr("Couldn't write codon counts to " << filename);
-}
+Offset const ORFCaller::SW_REF_PAD;
 
 void ORFCaller::writeAminoAcidCounts( std::string const& filename )
 {
@@ -939,18 +1183,40 @@ void ORFCaller::writeAminoAcidCounts( std::string const& filename )
         FatalErr("Couldn't write amino acid counts to " << filename);
 }
 
-void ORFCaller::writeIndelCounts( std::string const& filename )
+void ORFCaller::writeCodonCounts( std::string const& filename )
 {
     std::ofstream ofs(filename);
-    ofs << "NFS\tFS\tTotal\n";
+    ofs <<
+"AAA\tAAC\tAAG\tAAT\tACA\tACC\tACG\tACT\tAGA\tAGC\tAGG\tAGT\tATA\tATC\tATG\tATT\t"
+"CAA\tCAC\tCAG\tCAT\tCCA\tCCC\tCCG\tCCT\tCGA\tCGC\tCGG\tCGT\tCTA\tCTC\tCTG\tCTT\t"
+"GAA\tGAC\tGAG\tGAT\tGCA\tGCC\tGCG\tGCT\tGGA\tGGC\tGGG\tGGT\tGTA\tGTC\tGTG\tGTT\t"
+"TAA\tTAC\tTAG\tTAT\tTCA\tTCC\tTCG\tTCT\tTGA\tTGC\tTGG\tTGT\tTTA\tTTC\tTTG\tTTT";
 
     for ( CodonCounts const& cCounts : mCCV )
     {
-        size_t total = cCounts.mIndelCounts[0]+cCounts.mIndelCounts[1];
-        total = std::accumulate(cCounts.mCounts,cCounts.mCounts+NCODONS,total);
+        char prefix = '\n';
+        for ( size_t count : cCounts.mCounts )
+        {
+            ofs << prefix << count;
+            prefix = '\t';
+        }
+    }
+    ofs << '\n';
+    ofs.close();
+    if ( !ofs )
+        FatalErr("Couldn't write codon counts to " << filename);
+}
+
+void ORFCaller::writeIndelCounts( std::string const& filename )
+{
+    std::ofstream ofs(filename);
+    ofs << "NFS\tFS\tTotCvg\n";
+
+    for ( CodonCounts const& cCounts : mCCV )
+    {
         ofs << cCounts.mIndelCounts[0] << '\t'
             << cCounts.mIndelCounts[1] << '\t'
-            << total << '\n';
+            << cCounts.mCoverage << '\n';
     }
     ofs.close();
     if ( !ofs )
@@ -962,8 +1228,7 @@ void ORFCaller::report( std::ostream& os )
     if ( !mNAlignedReads )
         FatalErr("Not even a single read aligned.");
 
-    Sequence orfSeq = mRef.getORFSeq();
-    Sequence::const_iterator iORF = orfSeq.cbegin();
+    auto iORFWTCodon = mRef.getORFWTCodons().begin();
     unsigned codonId = 0;
 
     size_t minAA = std::numeric_limits<size_t>::max();
@@ -977,8 +1242,8 @@ void ORFCaller::report( std::ostream& os )
     for ( CodonCounts const& cCounts : mCCV )
     {
         mAANamer.getAACounts(cCounts.mCounts,&aaCounts);
-        size_t aaId = mAANamer.indexFor(iORF);
-        iORF += 3;
+        size_t aaId = mAANamer.indexFor(*iORFWTCodon);
+        ++iORFWTCodon;
         size_t min = std::numeric_limits<size_t>::max();
         size_t max = std::numeric_limits<size_t>::min();
         size_t tot = 0;
@@ -993,7 +1258,7 @@ void ORFCaller::report( std::ostream& os )
             if ( count ) ++aa;
             tot += count;
         }
-        double dTot = (tot+*iWildType)/100.;
+        double dTot = cCounts.mCoverage/100.;
         os << ++codonId
                   << '\t' << mAANamer[aaId]
                   << '\t' << min/dTot
@@ -1016,28 +1281,23 @@ void ORFCaller::report( std::ostream& os )
          << "% of aligning reads contained frame-shifting indels.\n";
 }
 
-bool ORFCaller::findIndels( Alignment const& aln,
-                                Sequence const& seq, Quals const& )
+ReadReport ORFCaller::findIndels( Alignment const& aln,
+                                  Sequence const& seq,
+                                  Quals const& quals )
 {
-    if ( aln.empty() )
-        return false;
-
-    Alignment alnBeg;
-    if ( !mRef.findFirstAlignment(seq, &alnBeg)
-            || aln.isReadRC() != alnBeg.isReadRC() )
-        return false;
-
     Sequence const& ref = mRef.getRef();
-    Sequence::const_iterator refBeg, refEnd, seqBeg, seqEnd;
+    Offset refStart = aln.getRefStart()-std::min(aln.getRefStart(),SW_REF_PAD);
+    Sequence::const_iterator refItr(ref.begin()+refStart);
+    Sequence::const_iterator refEnd(ref.begin()+
+                std::min(aln.getRefEnd()+SW_REF_PAD,ref.size()));
+    Sequence::const_iterator seqItr, seqEnd;
+    Quals::const_iterator qualItr;
 
     if ( !aln.isReadRC() )
     {
-        if ( alnBeg.getRefStart() >= aln.getRefEnd() )
-            return false;
-        refBeg = ref.begin() + alnBeg.getRefStart();
-        refEnd = ref.begin() + aln.getRefEnd();
-        seqBeg = seq.begin() + alnBeg.getReadStart();
+        seqItr = seq.begin() + aln.getReadStart();
         seqEnd = seq.begin() + aln.getReadEnd();
+        qualItr = seq.begin() + aln.getReadStart();
     }
     else
     {
@@ -1045,185 +1305,74 @@ bool ORFCaller::findIndels( Alignment const& aln,
         mSeqTmp.reserve(seq.size());
         for ( auto itr = seq.rbegin(), end = seq.rend(); itr != end; ++itr )
             mSeqTmp.push_back(complement(*itr));
-        if ( aln.getRefStart() >= alnBeg.getRefEnd() )
-            return false;
-        refBeg = ref.begin() + aln.getRefStart();
-        refEnd = ref.begin() + alnBeg.getRefEnd();
-        seqBeg = mSeqTmp.begin() + aln.getReadStart();
-        seqEnd = mSeqTmp.begin() + alnBeg.getReadEnd();
+        seqItr = mSeqTmp.begin() + aln.getReadStart();
+        seqEnd = mSeqTmp.begin() + aln.getReadEnd();
+        mQualsTmp = quals;
+        std::reverse(mQualsTmp.begin(),mQualsTmp.end());
+        qualItr = mQualsTmp.begin() + aln.getReadStart();
     }
 
-    int score = mSW.align(seqBeg, seqEnd, refBeg, refEnd);
-    double perBaseScore = 1. * score / (refEnd - refBeg);
-    if ( perBaseScore < mMinPerBaseSWScore )
-        return false;
-
-    auto iExon = mRef.getORF().begin();
-    using std::distance;
-    bool hasFSIndel = false;
-    bool hasNFSIndel = false;
-    Offset refPos = distance(ref.begin(), refBeg);
-    Offset orfPos = 0;
-    for ( SmithWatermanizer::Block const& block : mSW.getMatchup() )
+    auto const& blocks = mSW.align(seqItr,seqEnd,refItr,refEnd);
+    auto blkItr = blocks.begin();
+    if ( blkItr->mDir == SmithWatermanizer::Trace::UP )
     {
-        while ( iExon->mEnd <= refPos )
-        {
-            orfPos += iExon->size();
-            ++iExon;
-        }
-        bool fs = block.mLen % 3;
-        if ( block.mDir != SmithWatermanizer::Trace::DIAG
-                && refPos >= iExon->mBegin )
-        {
-            mIndelLocs.emplace_back((orfPos+refPos-iExon->mBegin)/3,fs);
-            if ( fs ) hasFSIndel = true;
-            else hasNFSIndel = true;
-        }
-        refPos += block.mLen;
-    }
-    if ( hasFSIndel )
-        mNFSIndelReads += 1;
-    else if ( hasNFSIndel )
-        mNFPIndelReads += 1;
-    ++mNAlignedReads;
-    return true;
-}
-
-void ORFCaller::processIndelLocs()
-{
-    if ( mIndelLocs.size() )
-    {
-        auto beg = mIndelLocs.begin(), end = mIndelLocs.end();
-        std::sort(beg,end);
-        mIndelLocs.erase(std::unique(beg,end),end);
-        for ( IndelLoc const& il : mIndelLocs )
-            mCCV[il.mCodonId].mIndelCounts[il.mFrameShift] += 1;
-    }
-}
-
-void ORFCaller::processAlignment( Alignment const& alnA,
-                                    Sequence const& seq, Quals const& quals )
-{
-    ++mNAlignedReads;
-
-    Alignment aln(alnA);
-    auto oItr = mRef.getORF().begin();
-    Offset orfStart = 0;
-    while ( oItr->mEnd <= aln.getRefStart() )
-    {
-        orfStart += oItr->size();
-        ++oItr;
+        refStart += blkItr->mLen;
+        refItr += blkItr->mLen;
+        ++blkItr;
     }
 
-    if ( aln.getRefStart() > oItr->mBegin )
-        orfStart += aln.getRefStart() - oItr->mBegin;
-    CodonAccumulator acc(mCCV.begin(),orfStart,mMinQ);
-
-    while ( oItr->mBegin < aln.getRefEnd() )
+    AlignmentScorer alignmentScorer(mRef,refStart,mMinQ);
+    std::vector<Variation> indels;
+    for ( auto blkEnd(blocks.end()); blkItr != blkEnd; ++blkItr )
     {
-        if ( oItr->mBegin > aln.getRefStart() )
-            aln += oItr->mBegin - aln.getRefStart();
-
-        Offset len = std::min(aln.getRefEnd(),oItr->mEnd)-aln.getRefStart();
-        if ( aln.isReadRC() )
+        unsigned nnn = blkItr->mLen;
+        switch ( blkItr->mDir )
         {
-            auto qItr = quals.rbegin()+aln.getReadStart();
-            auto sItr = seq.rbegin()+aln.getReadStart();
-            for ( auto sEnd = sItr+len; sItr != sEnd; ++sItr,++qItr )
-                acc(complement(*sItr),*qItr);
-        }
-        else
-        {
-            auto qItr = quals.begin()+aln.getReadStart();
-            auto sItr = seq.begin()+aln.getReadStart();
-            for ( auto sEnd = sItr+len; sItr != sEnd; ++sItr,++qItr )
-                acc(*sItr,*qItr);
-        }
-        aln += len;
-        if ( aln.empty() )
+        case SmithWatermanizer::Trace::UP:
+            if ( alignmentScorer.inORF() &&
+                    qualItr[-1] >= mMinQ && qualItr[0] >= mMinQ )
+                indels.push_back(Variation{VariationType::DELETION,
+                                            alignmentScorer.getCodonIdx(),
+                                            nnn});
+            while ( nnn-- )
+            {
+                alignmentScorer(*refItr,NCALL,0);
+                ++refItr;
+            }
             break;
-        ++oItr;
-    }
-}
-
-// make a super-read out of the pair.
-// this is super ugly.  sorry.  can't figure out anything clean and elegant.
-void ORFCaller::processAlignmentPair( Alignment const& aln1,
-        Alignment const& aln2, Sequence const& seq1, Sequence const& seq2,
-        Quals const& quals1, Quals const& quals2 )
-{
-    if ( aln1.isReadRC() == aln2.isReadRC() )
-        return; // one of the alignments is bogus
-                // pairs cannot be on the same strand
-
-    if ( aln1.getRefStart() > aln2.getRefStart() )
-        FatalErr("Internal error: aln1 starts after aln2.");
-
-    mSeqTmp.clear();
-    mSeqTmp.reserve(seq1.size()+seq2.size());
-    mQualsTmp.clear();
-    mQualsTmp.reserve(quals1.size()+quals2.size());
-
-    if ( aln1.isReadRC() )
-    {
-        for ( auto itr=seq1.rbegin()+aln1.getReadStart(),
-                end=seq1.rbegin()+aln1.getReadEnd(); itr != end; ++itr )
-            mSeqTmp.push_back(complement(*itr));
-        mQualsTmp.assign(quals1.rbegin()+aln1.getReadStart(),
-                            quals1.rbegin()+aln1.getReadEnd());
-        Offset overlapLen = std::min(aln1.getRefEnd(),aln2.getRefEnd())-
-                                aln2.getRefStart();
-        Offset start1 = aln2.getRefStart() - aln1.getRefStart();
-        auto s1 = mSeqTmp.begin()+start1;
-        auto s2 = seq2.begin()+aln2.getReadStart();
-        auto q2 = quals2.begin()+aln2.getReadStart();
-        for ( auto q1=mQualsTmp.begin()+start1,
-                   qEnd=q1+overlapLen; q1 != qEnd; ++s1,++q1,++s2,++q2 )
-            if ( *q2 > *q1 ) { *s1 = *s2; *q1 = *q2; }
-        if ( aln2.getRefEnd() > aln1.getRefEnd() )
-        {
-            Offset extra = aln2.getRefEnd()-aln1.getRefEnd();
-            auto sEnd = seq2.begin()+aln2.getReadEnd();
-            std::copy(sEnd-extra,sEnd,std::back_inserter(mSeqTmp));
-            auto qEnd = quals2.begin()+aln2.getReadEnd();
-            std::copy(qEnd-extra,qEnd,std::back_inserter(mQualsTmp));
+        case SmithWatermanizer::Trace::LEFT:
+            {
+                bool loQ = false;
+                while ( nnn-- )
+                {
+                    if ( *qualItr < mMinQ )
+                        loQ = true;
+                    ++seqItr; ++qualItr;
+                }
+                if ( !loQ && alignmentScorer.inORF() )
+                    indels.push_back(Variation{VariationType::INSERTION,
+                                                alignmentScorer.getCodonIdx(),
+                                                blkItr->mLen});
+            }
+            break;
+        case SmithWatermanizer::Trace::DIAG:
+            while ( nnn-- )
+            {
+                alignmentScorer(*refItr,*seqItr,*qualItr);
+                ++refItr; ++seqItr; ++qualItr;
+            }
+            break;
+        case SmithWatermanizer::Trace::DONE:
+            FatalErr("found DONE block in traceback");
         }
     }
-    else
-    {
-        mSeqTmp.assign(seq1.begin()+aln1.getReadStart(),
-                        seq1.begin()+aln1.getReadEnd());
-        mQualsTmp.assign(quals1.begin()+aln1.getReadStart(),
-                            quals1.begin()+aln1.getReadEnd());
-        Offset overlapLen = std::min(aln1.getRefEnd(),aln2.getRefEnd())-
-                                aln2.getRefStart();
-        Offset start1 = aln2.getRefStart() - aln1.getRefStart();
-        auto s1 = mSeqTmp.begin()+start1;
-        auto s2 = seq2.rbegin()+aln2.getReadStart();
-        auto q2 = quals2.rbegin()+aln2.getReadStart();
-        for ( auto q1=mQualsTmp.begin()+start1,
-                   qEnd=q1+overlapLen; q1 != qEnd; ++s1,++q1,++s2,++q2 )
-            if ( *q2 > *q1 ) { *s1 = complement(*s2); *q1 = *q2; }
-        if ( aln2.getRefEnd() > aln1.getRefEnd() )
-        {
-            Offset extra = aln2.getRefEnd()-aln1.getRefEnd();
-            auto sEnd = seq2.rbegin()+aln2.getReadEnd();
-            for ( auto sItr = sEnd-extra; sItr != sEnd; ++sItr )
-                mSeqTmp.push_back(complement(*sItr));
-            auto qEnd = quals2.rbegin()+aln2.getReadEnd();
-            std::copy(qEnd-extra,qEnd,std::back_inserter(mQualsTmp));
-        }
-    }
-    Alignment aln(aln1.getRefStart(),
-                    std::max(aln1.getRefEnd(),aln2.getRefEnd()),
-                    0,false);
-    processAlignment( aln, mSeqTmp, mQualsTmp );
-    ++mNAlignedReads;
+    ReadReport report = alignmentScorer.getReport();
+    report.mVariations.insert(report.mVariations.end(),
+                                    indels.begin(),indels.end());
+    return report;
 }
 
-
-
-void processFastqs( char** beg, char** end, ORFCaller* pCaller )
+void ORFCaller::processFastqs( char** beg, char** end )
 {
     std::vector<Sequence> seqs;
     std::vector<Quals> quals;
@@ -1239,7 +1388,7 @@ void processFastqs( char** beg, char** end, ORFCaller* pCaller )
             auto qItr = quals.begin();
             for ( Sequence const& sq : seqs )
             {
-                pCaller->processRead(sq,*qItr,fileName,readId++);
+                processRead(sq,*qItr,fileName,readId++);
                 ++qItr;
             }
         }
@@ -1248,7 +1397,7 @@ void processFastqs( char** beg, char** end, ORFCaller* pCaller )
     }
 }
 
-void processPairedFastqs( char** beg, char** end, ORFCaller* pCaller )
+void ORFCaller::processPairedFastqs( char** beg, char** end )
 {
     if ( (beg-end) & 1 )
         FatalErr("You requested paired mode, but there are an "
@@ -1276,7 +1425,7 @@ void processPairedFastqs( char** beg, char** end, ORFCaller* pCaller )
             auto sItr1=seqs1.begin(), sEnd=seqs1.end(), sItr2=seqs2.begin();
             auto qItr1=quals1.begin(), qItr2=quals2.begin();
             for ( ; sItr1 != sEnd; ++sItr1,++sItr2,++qItr1,++qItr2 )
-                pCaller->processPairedRead(*sItr1,*qItr1,*sItr2,*qItr2,
+                processPairedRead(*sItr1,*qItr1,*sItr2,*qItr2,
                                             fileName1,fileName2,readId++);
         }
         if ( fqr2.getChunk(seqs2,quals2) )
@@ -1296,18 +1445,25 @@ int main( int argc, char** argv )
     std::string outputFilename = "orfcall";
     bool pairedMode = false;
     unsigned minQ = 20;
+    unsigned maxSeqErrs = 2;
     double minPerBaseSWScore = 2.;
     std::string codonTranslation =
             "KNKNTTTTRSRSIIMIQHQHPPPPRRRRLLLLEDEDAAAAGGGGVVVVZYZYSSSSZCWCLFLF";
 
     int opt;
-    while ( (opt = getopt(argc, argv, "dK:M:O:pQ:S:T:")) != -1 )
+    while ( (opt = getopt(argc, argv, "dE:K:M:O:pQ:S:T:")) != -1 )
     {
         switch ( opt )
         {
         case 'd':
             dumpNonAligners = true;
             break;
+        case 'E':
+        { std::istringstream iss(optarg);
+          if ( !(iss >> maxSeqErrs) )
+              FatalErr("Can't interpret E='" << optarg
+                      << "'. Expecting an integer maximum for sequencing errors per read."); }
+          break;
         case 'K':
           { std::istringstream iss(optarg);
             if ( !(iss >> K) || K < 14 || K > 64 )
@@ -1351,7 +1507,9 @@ int main( int argc, char** argv )
                         " as a table of codon calls.  Expected 64 characters.");
             break;
         case '?':
-            if ( optopt == 'K' )
+            if ( optopt == 'E' )
+                FatalErr("Need value for E (max seq errs) option.");
+            else if ( optopt == 'K' )
                 FatalErr("Need value for K (kmer size) option.");
             else if ( optopt == 'M' )
                 FatalErr("Need value for M (max mismatch fraction) option.");
@@ -1369,30 +1527,33 @@ int main( int argc, char** argv )
         }
     }
 
-    if ( optind >= argc )
-        FatalErr("Usage: ORFCall [-d] [-K KMER_SIZE] [-M MAX_MISMATCH_FRACTION] "
-                 "[-O OUTPUT_FILENAME] [-p] [-Q MIN_QUAL] [-T CODON_TABLE] "
-                 "ref.fasta reads1.fastq [reads2.fastq...]\n"
-                 "The -p flag signals paired mode.\n");
+    if ( optind+2 > argc )
+        FatalErr("Usage: ORFCall [-d] [-E MAX_SEQ_ERRS] [-K KMER_SIZE] "
+                      " [-M MAX_MISMATCH_FRACTION]"
+                      " [-O OUTPUT_FILENAME] [-p] [-Q MIN_QUAL] [-T CODON_TABLE] "
+                      "ref.fasta codons_used.dat reads1.fastq [reads2.fastq...]\n"
+                      "The -p flag signals paired mode.\n");
 
-    Reference ref(argv[optind++],K,minQ,maxMismatchFrac);
+    Reference ref(argv[optind],argv[optind+1],K);
     ref.report();
+    optind += 2;
 
     std::ofstream* pJunkOS = nullptr;
     if ( dumpNonAligners )
         pJunkOS = new std::ofstream(outputFilename+".unaligned.fasta");
     AminoAcidNamer aaNamer(codonTranslation);
-    ORFCaller caller(ref,minPerBaseSWScore,minQ,aaNamer,pJunkOS);
+    ORFCaller caller(ref,minPerBaseSWScore,minQ,maxSeqErrs,aaNamer,pJunkOS);
     char** beg = argv+optind;
     char** end = argv+argc;
     if ( !pairedMode )
-        processFastqs(beg,end,&caller);
+        caller.processFastqs(beg,end);
     else
-        processPairedFastqs(beg,end,&caller);
+        caller.processPairedFastqs(beg,end);
     std::cerr << "Aligned reads: " << 100.*caller.getFractionAligned() << "%\n";
 
     if ( pJunkOS )
         delete pJunkOS;
+
     caller.writeCodonCounts(outputFilename+".cdn");
     caller.writeAminoAcidCounts(outputFilename+".aa");
     caller.writeIndelCounts(outputFilename+".indels");
