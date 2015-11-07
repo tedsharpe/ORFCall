@@ -854,7 +854,10 @@ public:
       mFirstCodonCovered(0), mNMismatches(0)
     {
         while ( mExonItr->mEnd <= mRefPos )
+        {
             mFirstCodonCovered += mExonItr->size();
+            ++mExonItr;
+        }
         mNextExon = *mExonItr;
         if ( mRefPos > mExonItr->mBegin )
             mFirstCodonCovered += mRefPos - mExonItr->mBegin;
