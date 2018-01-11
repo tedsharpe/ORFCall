@@ -953,10 +953,10 @@ private:
 class ORFCaller
 {
 public:
-    ORFCaller( Reference const& ref, double minSW, Qual minQ,
+    ORFCaller( Reference const& ref, Qual minQ,
                         unsigned maxSeqErrs, AminoAcidNamer const& aaNamer,
                         std::ostream* pJunkOS )
-    : mRef(ref), mMinPerBaseSWScore(minSW), mMinQ(minQ),
+    : mRef(ref), mMinQ(minQ),
       mMaxSeqErrs(maxSeqErrs), mAANamer(aaNamer),
       mCCV(ref.getORFWTCodons().size()), mNReads(0), mNAlignedReads(0),
       mNFPIndelReads(0), mNFSIndelReads(0), mpJunkOS(pJunkOS)
@@ -1142,7 +1142,6 @@ private:
       os << '\n'; }
 
     Reference const& mRef;
-    double mMinPerBaseSWScore;
     Qual mMinQ;
     unsigned mMaxSeqErrs;
     AminoAcidNamer const& mAANamer;
@@ -1449,12 +1448,11 @@ int main( int argc, char** argv )
     bool pairedMode = false;
     unsigned minQ = 20;
     unsigned maxSeqErrs = 2;
-    double minPerBaseSWScore = 2.;
     std::string codonTranslation =
             "KNKNTTTTRSRSIIMIQHQHPPPPRRRRLLLLEDEDAAAAGGGGVVVVZYZYSSSSZCWCLFLF";
 
     int opt;
-    while ( (opt = getopt(argc, argv, "dE:K:M:O:pQ:S:T:")) != -1 )
+    while ( (opt = getopt(argc, argv, "dE:K:M:O:pQ:T:")) != -1 )
     {
         switch ( opt )
         {
@@ -1497,12 +1495,6 @@ int main( int argc, char** argv )
                 FatalErr("Can't interpret Q='" << optarg
                         << "'. Expecting an integer min quality score."); }
             break;
-        case 'S':
-          { std::istringstream iss(optarg);
-            if ( !(iss >> minPerBaseSWScore) )
-                FatalErr("Can't interpret S='" << optarg
-                        << "'. Expecting a minimum per-base S/W score."); }
-            break;
         case 'T':
             codonTranslation = optarg;
             if ( codonTranslation.size() != NCODONS )
@@ -1520,8 +1512,6 @@ int main( int argc, char** argv )
                 FatalErr("Need value for O (output filename) option.");
             else if ( optopt == 'Q' )
                 FatalErr("Need value for Q (min quality score) option.");
-            else if ( optopt == 'S' )
-                FatalErr("Need value for S (min per-base S/W score.");
             else if ( optopt == 'T' )
                 FatalErr("Need value for T (table of codon calls) option.");
             else
@@ -1545,7 +1535,7 @@ int main( int argc, char** argv )
     if ( dumpNonAligners )
         pJunkOS = new std::ofstream(outputFilename+".unaligned.fasta");
     AminoAcidNamer aaNamer(codonTranslation);
-    ORFCaller caller(ref,minPerBaseSWScore,minQ,maxSeqErrs,aaNamer,pJunkOS);
+    ORFCaller caller(ref,minQ,maxSeqErrs,aaNamer,pJunkOS);
     char** beg = argv+optind;
     char** end = argv+argc;
     if ( !pairedMode )
